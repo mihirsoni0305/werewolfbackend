@@ -5,8 +5,7 @@ const { MongoClient, ObjectId } = require("mongodb")
 const cors = require("cors")
 
 // MongoDB connection
-const MONGODB_URI = process.env.MONGODB_URI ||
-  "mongodb+srv://mihirsonidev:mihir%40123@cluster0.1tah4os.mongodb.net/werewolf?retryWrites=true&w=majority";
+const MONGODB_URI = process.env.MONGODB_URI || "mongodb://localhost:27017/werewolf"
 const MONGODB_DB = process.env.MONGODB_DB || "werewolf"
 
 let db
@@ -27,8 +26,9 @@ const io = new Server(server, {
   pingTimeout: 60000, // Increase ping timeout to prevent premature disconnects
 })
 
-// Track connections by device ID to prevent duplicates
-const deviceConnections = new Map()
+// Track active connections and game subscriptions
+const activeConnections = new Map() // socketId -> { gameId, playerId }
+const gameSubscriptions = new Map() // gameId -> Set of socketIds
 
 // Game state management
 const activeGames = new Map()
@@ -49,11 +49,17 @@ async function connectToMongoDB() {
 // Game logic functions
 async function loadGameFromDB(gameId) {
   try {
+    console.log(`Loading game ${gameId} from database`)
     const game = await db.collection("games").findOne({ gameId })
     if (game) {
+      console.log(
+        `Game ${gameId} loaded with ${game.players.length} players:`,
+        game.players.map((p) => `${p.name} (${p.id})`),
+      )
       activeGames.set(gameId, game)
       return game
     }
+    console.log(`Game ${gameId} not found in database`)
     return null
   } catch (error) {
     console.error("Error loading game:", error)
@@ -64,9 +70,32 @@ async function loadGameFromDB(gameId) {
 async function saveGameToDB(game) {
   try {
     await db.collection("games").updateOne({ gameId: game.gameId }, { $set: game }, { upsert: true })
+    console.log(`Game ${game.gameId} saved to database with ${game.players.length} players`)
   } catch (error) {
     console.error("Error saving game:", error)
   }
+}
+
+// Broadcast game update to all clients subscribed to this game
+function broadcastGameUpdate(gameId) {
+  const game = activeGames.get(gameId)
+  if (!game) {
+    console.log(`Cannot broadcast update for game ${gameId}: game not found`)
+    return
+  }
+
+  const socketIds = gameSubscriptions.get(gameId) || new Set()
+  console.log(`Broadcasting game update to ${socketIds.size} clients for game ${gameId}`)
+
+  const sanitizedGame = sanitizeGame(game)
+
+  // Broadcast to all sockets subscribed to this game
+  socketIds.forEach((socketId) => {
+    const socket = io.sockets.sockets.get(socketId)
+    if (socket) {
+      socket.emit("game:update", sanitizedGame)
+    }
+  })
 }
 
 function checkWinCondition(game) {
@@ -106,7 +135,7 @@ function startGameTimer(gameId) {
     game.timeLeft -= 1
 
     // Broadcast time update
-    io.to(gameId).emit("game:update", sanitizeGame(game))
+    broadcastGameUpdate(gameId)
 
     // Phase is over
     if (game.timeLeft <= 0) {
@@ -122,7 +151,7 @@ function startGameTimer(gameId) {
 }
 
 async function handleNightEnd(game) {
-  const gameId = game.gameId // Declare gameId variable
+  const gameId = game.gameId
   // Process night actions
   const { werewolf: attackedId, doctor: protectedId, seer: investigatedId } = game.nightActions
 
@@ -148,7 +177,7 @@ async function handleNightEnd(game) {
         isSystem: true,
         timestamp: Date.now(),
       }
-      io.to(gameId).emit("game:message", systemMessage)
+      broadcastMessage(gameId, systemMessage)
     }
   }
 
@@ -168,7 +197,7 @@ async function handleNightEnd(game) {
           isSystem: true,
           timestamp: Date.now(),
         }
-        io.to(seer.id).emit("game:message", privateMessage)
+        sendPrivateMessage(seer.id, privateMessage)
       })
     }
   }
@@ -188,7 +217,7 @@ async function handleNightEnd(game) {
       isSystem: true,
       timestamp: Date.now(),
     }
-    io.to(gameId).emit("game:message", systemMessage)
+    broadcastMessage(gameId, systemMessage)
   } else {
     // Transition to day phase
     game.phase = "day"
@@ -208,21 +237,21 @@ async function handleNightEnd(game) {
       isSystem: true,
       timestamp: Date.now(),
     }
-    io.to(game.gameId).emit("game:message", systemMessage)
+    broadcastMessage(gameId, systemMessage)
 
     // Start day timer
-    startGameTimer(game.gameId)
+    startGameTimer(gameId)
   }
 
   // Save game state
   await saveGameToDB(game)
 
   // Broadcast updated game state
-  io.to(game.gameId).emit("game:update", sanitizeGame(game))
+  broadcastGameUpdate(gameId)
 }
 
 async function handleDayEnd(game) {
-  const gameId = game.gameId // Declare gameId variable
+  const gameId = game.gameId
   // Count votes
   const votes = game.votes
   const voteCounts = {}
@@ -262,7 +291,7 @@ async function handleDayEnd(game) {
         isSystem: true,
         timestamp: Date.now(),
       }
-      io.to(gameId).emit("game:message", systemMessage)
+      broadcastMessage(gameId, systemMessage)
     }
   } else {
     // No one was eliminated
@@ -273,7 +302,7 @@ async function handleDayEnd(game) {
       isSystem: true,
       timestamp: Date.now(),
     }
-    io.to(gameId).emit("game:message", systemMessage)
+    broadcastMessage(gameId, systemMessage)
   }
 
   // Check win condition
@@ -291,7 +320,7 @@ async function handleDayEnd(game) {
       isSystem: true,
       timestamp: Date.now(),
     }
-    io.to(gameId).emit("game:message", systemMessage)
+    broadcastMessage(gameId, systemMessage)
   } else {
     // Transition to night phase
     game.phase = "night"
@@ -311,17 +340,43 @@ async function handleDayEnd(game) {
       isSystem: true,
       timestamp: Date.now(),
     }
-    io.to(game.gameId).emit("game:message", systemMessage)
+    broadcastMessage(gameId, systemMessage)
 
     // Start night timer
-    startGameTimer(game.gameId)
+    startGameTimer(gameId)
   }
 
   // Save game state
   await saveGameToDB(game)
 
   // Broadcast updated game state
-  io.to(game.gameId).emit("game:update", sanitizeGame(game))
+  broadcastGameUpdate(gameId)
+}
+
+// Helper function to broadcast a message to all clients in a game
+function broadcastMessage(gameId, message) {
+  const socketIds = gameSubscriptions.get(gameId) || new Set()
+  console.log(`Broadcasting message to ${socketIds.size} clients for game ${gameId}:`, message.message)
+
+  socketIds.forEach((socketId) => {
+    const socket = io.sockets.sockets.get(socketId)
+    if (socket) {
+      socket.emit("game:message", message)
+    }
+  })
+}
+
+// Helper function to send a private message to a specific player
+function sendPrivateMessage(playerId, message) {
+  // Find all sockets for this player
+  for (const [socketId, data] of activeConnections.entries()) {
+    if (data.playerId === playerId) {
+      const socket = io.sockets.sockets.get(socketId)
+      if (socket) {
+        socket.emit("game:message", message)
+      }
+    }
+  }
 }
 
 // Sanitize game data for clients
@@ -338,21 +393,24 @@ function sanitizeGame(game) {
 
 // Socket.io connection handling
 io.on("connection", async (socket) => {
-  const { gameId, playerId, deviceId } = socket.handshake.query
+  const { gameId, playerId } = socket.handshake.query
 
-  console.log(`Player ${playerId} connected to game ${gameId} from device ${deviceId}`)
+  console.log(`Socket ${socket.id} connected for game ${gameId}, player ${playerId}`)
+  console.log(`Total connections: ${io.engine.clientsCount}`)
 
-  // Store this connection with its device ID
-  if (deviceId) {
-    deviceConnections.set(deviceId, socket.id)
+  // Store connection info
+  activeConnections.set(socket.id, { gameId, playerId })
+
+  // Add to game subscriptions
+  if (!gameSubscriptions.has(gameId)) {
+    gameSubscriptions.set(gameId, new Set())
   }
-
-  // Join the game room
-  socket.join(gameId)
-  socket.join(playerId) // For private messages
+  gameSubscriptions.get(gameId).add(socket.id)
 
   // Handle game join
   socket.on("game:join", async ({ gameId }) => {
+    console.log(`Player ${playerId} joining game ${gameId}`)
+
     let game = activeGames.get(gameId)
 
     if (!game) {
@@ -369,12 +427,78 @@ io.on("connection", async (socket) => {
       }
     }
 
-    // Send game state to the client
+    // Send game state to the client that just joined
     socket.emit("game:update", sanitizeGame(game))
+
+    // Also broadcast to all other clients to ensure everyone has the latest state
+    broadcastGameUpdate(gameId)
+  })
+
+  // Handle player joining the game (from the join page)
+  socket.on("player:join", async ({ gameId, playerName }) => {
+    console.log(`New player ${playerName} (${playerId}) joining game ${gameId}`)
+
+    let game = activeGames.get(gameId)
+    if (!game) {
+      game = await loadGameFromDB(gameId)
+      if (!game) {
+        socket.emit("game:error", "Game not found")
+        return
+      }
+    }
+
+    // Check if game is still in waiting status
+    if (game.status !== "waiting") {
+      socket.emit("game:error", "Game has already started")
+      return
+    }
+
+    // Check if player limit reached
+    if (game.players.length >= game.settings.totalPlayers) {
+      socket.emit("game:error", "Game is full")
+      return
+    }
+
+    // Check if player already exists (by ID)
+    const existingPlayer = game.players.find((p) => p.id === playerId)
+    if (existingPlayer) {
+      console.log(`Player ${playerName} (${playerId}) already in game`)
+      socket.emit("game:update", sanitizeGame(game))
+      return
+    }
+
+    // Add player to the game
+    game.players.push({
+      id: playerId,
+      name: playerName,
+      role: null,
+      isAlive: true,
+      isRevealed: false,
+    })
+
+    // Save game to database
+    await saveGameToDB(game)
+
+    // Broadcast updated game state to all clients
+    broadcastGameUpdate(gameId)
+
+    // Send system message
+    const systemMessage = {
+      id: Date.now().toString(),
+      sender: "System",
+      message: `${playerName} has joined the game.`,
+      isSystem: true,
+      timestamp: Date.now(),
+    }
+    broadcastMessage(gameId, systemMessage)
   })
 
   // Handle game actions (vote, attack, protect, investigate)
   socket.on("game:action", async ({ action, target, playerId }) => {
+    const connectionData = activeConnections.get(socket.id)
+    if (!connectionData) return
+
+    const { gameId } = connectionData
     const game = activeGames.get(gameId)
     if (!game || game.status !== "playing") return
 
@@ -396,7 +520,7 @@ io.on("connection", async (socket) => {
             isSystem: true,
             timestamp: Date.now(),
           }
-          io.to(gameId).emit("game:message", systemMessage)
+          broadcastMessage(gameId, systemMessage)
 
           // Check if everyone has voted
           const alivePlayers = game.players.filter((p) => p.isAlive)
@@ -409,7 +533,7 @@ io.on("connection", async (socket) => {
           } else {
             // Save and broadcast game state
             await saveGameToDB(game)
-            io.to(gameId).emit("game:update", sanitizeGame(game))
+            broadcastGameUpdate(gameId)
           }
         }
         break
@@ -429,7 +553,7 @@ io.on("connection", async (socket) => {
               isSystem: true,
               timestamp: Date.now(),
             }
-            io.to(wolf.id).emit("game:message", privateMessage)
+            sendPrivateMessage(wolf.id, privateMessage)
           })
 
           // Check if all night actions are complete
@@ -450,7 +574,7 @@ io.on("connection", async (socket) => {
             isSystem: true,
             timestamp: Date.now(),
           }
-          io.to(player.id).emit("game:message", privateMessage)
+          sendPrivateMessage(player.id, privateMessage)
 
           // Check if all night actions are complete
           checkNightActionsComplete(game)
@@ -470,7 +594,7 @@ io.on("connection", async (socket) => {
             isSystem: true,
             timestamp: Date.now(),
           }
-          io.to(player.id).emit("game:message", privateMessage)
+          sendPrivateMessage(player.id, privateMessage)
 
           // Check if all night actions are complete
           checkNightActionsComplete(game)
@@ -481,6 +605,10 @@ io.on("connection", async (socket) => {
 
   // Handle chat messages
   socket.on("game:chat", async ({ playerId, message }) => {
+    const connectionData = activeConnections.get(socket.id)
+    if (!connectionData) return
+
+    const { gameId } = connectionData
     const game = activeGames.get(gameId)
     if (!game) return
 
@@ -503,41 +631,78 @@ io.on("connection", async (socket) => {
       timestamp: Date.now(),
     }
 
-    io.to(gameId).emit("game:message", chatMessage)
+    broadcastMessage(gameId, chatMessage)
   })
 
   // Handle disconnection
   socket.on("disconnect", () => {
-    console.log(`Player ${playerId} disconnected from game ${gameId}`)
+    const connectionData = activeConnections.get(socket.id)
+    if (!connectionData) return
 
-    // Remove from device connections map
-    if (deviceId) {
-      deviceConnections.delete(deviceId)
+    const { gameId, playerId } = connectionData
+    console.log(`Socket ${socket.id} disconnected (Player ${playerId}, Game ${gameId})`)
+
+    // Remove from active connections
+    activeConnections.delete(socket.id)
+
+    // Remove from game subscriptions
+    const gameSockets = gameSubscriptions.get(gameId)
+    if (gameSockets) {
+      gameSockets.delete(socket.id)
+      if (gameSockets.size === 0) {
+        gameSubscriptions.delete(gameId)
+      }
     }
 
     // If game is in waiting state, handle player leaving
     const game = activeGames.get(gameId)
     if (game && game.status === "waiting") {
-      // Remove player if they disconnect during waiting phase
-      const playerIndex = game.players.findIndex((p) => p.id === playerId)
-
-      if (playerIndex !== -1) {
-        game.players.splice(playerIndex, 1)
-
-        // If host left, assign a new host
-        if (game.host.id === playerId && game.players.length > 0) {
-          game.host = game.players[0]
+      // Check if this was the last connection for this player
+      let playerHasOtherConnections = false
+      for (const [_, data] of activeConnections.entries()) {
+        if (data.playerId === playerId && data.gameId === gameId) {
+          playerHasOtherConnections = true
+          break
         }
+      }
 
-        // If no players left, remove the game
-        if (game.players.length === 0) {
-          activeGames.delete(gameId)
-          return
+      // Only remove player if they have no other connections
+      if (!playerHasOtherConnections) {
+        // Remove player if they disconnect during waiting phase
+        const playerIndex = game.players.findIndex((p) => p.id === playerId)
+
+        if (playerIndex !== -1) {
+          const playerName = game.players[playerIndex].name
+          game.players.splice(playerIndex, 1)
+          console.log(`Player ${playerName} (${playerId}) removed from game ${gameId}`)
+
+          // If host left, assign a new host
+          if (game.host.id === playerId && game.players.length > 0) {
+            game.host = game.players[0]
+            console.log(`New host assigned: ${game.host.name} (${game.host.id})`)
+          }
+
+          // If no players left, remove the game
+          if (game.players.length === 0) {
+            activeGames.delete(gameId)
+            console.log(`Game ${gameId} removed (no players left)`)
+            return
+          }
+
+          // Save and broadcast updated game state
+          saveGameToDB(game)
+          broadcastGameUpdate(gameId)
+
+          // Send system message
+          const systemMessage = {
+            id: Date.now().toString(),
+            sender: "System",
+            message: `${playerName} has left the game.`,
+            isSystem: true,
+            timestamp: Date.now(),
+          }
+          broadcastMessage(gameId, systemMessage)
         }
-
-        // Save and broadcast updated game state
-        saveGameToDB(game)
-        io.to(gameId).emit("game:update", sanitizeGame(game))
       }
     }
   })
@@ -579,7 +744,7 @@ async function checkNightActionsComplete(game) {
   } else {
     // Save and broadcast game state
     await saveGameToDB(game)
-    io.to(game.gameId).emit("game:update", sanitizeGame(game))
+    broadcastGameUpdate(game.gameId)
   }
 }
 
@@ -591,6 +756,7 @@ async function startServer() {
 
   server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`)
+    console.log(`CORS origin set to: ${process.env.CLIENT_URL || "*"}`)
   })
 }
 
