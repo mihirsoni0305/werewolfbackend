@@ -5,7 +5,8 @@ const { MongoClient, ObjectId } = require("mongodb")
 const cors = require("cors")
 
 // MongoDB connection
-const MONGODB_URI = process.env.MONGODB_URI || "mongodb://localhost:27017/werewolf"
+const MONGODB_URI = process.env.MONGODB_URI ||
+  "mongodb+srv://mihirsonidev:mihir%40123@cluster0.1tah4os.mongodb.net/werewolf?retryWrites=true&w=majority";
 const MONGODB_DB = process.env.MONGODB_DB || "werewolf"
 
 let db
