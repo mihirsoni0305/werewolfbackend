@@ -127,6 +127,23 @@ function sanitizeGame(game) {
   return sanitized
 }
 
+// Add this function to the server.js file to help with debugging
+function logGameState(gameId) {
+  const game = activeGames.get(gameId)
+  if (!game) {
+    console.log(`Game ${gameId} not found in active games`)
+    return
+  }
+
+  console.log(`Game ${gameId} state:`)
+  console.log(`- Status: ${game.status}`)
+  console.log(`- Host: ${game.host.name} (${game.host.id})`)
+  console.log(`- Players (${game.players.length}):`)
+  game.players.forEach((player, index) => {
+    console.log(`  ${index + 1}. ${player.name} (${player.id})`)
+  })
+}
+
 // Socket.io connection handling
 io.on("connection", async (socket) => {
   const { gameId, playerId } = socket.handshake.query
@@ -167,6 +184,99 @@ io.on("connection", async (socket) => {
     // Also broadcast to all other clients to ensure everyone has the latest state
     socket.to(gameId).emit("game:update", sanitizeGame(game))
     console.log(`Broadcast game state to other players in room ${gameId}`)
+  })
+
+  // Handle game start request
+  socket.on("game:start", async ({ gameId }) => {
+    console.log(`Received game:start request for game ${gameId} from player ${playerId}`)
+
+    let game = activeGames.get(gameId)
+    if (!game) {
+      game = await loadGameFromDB(gameId)
+      if (!game) {
+        socket.emit("game:error", "Game not found")
+        return
+      }
+    }
+
+    // Check if the player is the host
+    if (game.host.id !== playerId) {
+      socket.emit("game:error", "Only the host can start the game")
+      return
+    }
+
+    // Check if game is in waiting status
+    if (game.status !== "waiting") {
+      socket.emit("game:error", "Game has already started or finished")
+      return
+    }
+
+    // Check minimum players
+    if (game.players.length < 5) {
+      socket.emit("game:error", "Need at least 5 players to start")
+      return
+    }
+
+    console.log(`Starting game ${gameId}...`)
+
+    try {
+      // Assign roles
+      const players = [...game.players]
+      const roles = generateRoles(game.settings, players.length)
+
+      // Shuffle roles
+      for (let i = roles.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1))
+          ;[roles[i], roles[j]] = [roles[j], roles[i]]
+      }
+
+      // Assign roles to players
+      const playersWithRoles = players.map((player, index) => ({
+        ...player,
+        role: roles[index],
+      }))
+
+      // Update game status and players
+      game.status = "playing"
+      game.players = playersWithRoles
+      game.startedAt = new Date()
+      game.phase = "night"
+      game.round = 1
+      game.timeLeft = 30
+      game.nightActions = {
+        werewolf: null,
+        doctor: null,
+        seer: null,
+      }
+      game.dayAction = null
+      game.votes = {}
+      game.eliminations = []
+
+      // Save to database
+      await saveGameToDB(game)
+
+      console.log(`Game ${gameId} started successfully`)
+
+      // Broadcast game started event
+      io.to(gameId).emit("game:started")
+      io.to(gameId).emit("game:update", sanitizeGame(game))
+
+      // Send system message
+      const systemMessage = {
+        id: Date.now().toString(),
+        sender: "System",
+        message: "The game has started! Night phase begins...",
+        isSystem: true,
+        timestamp: Date.now(),
+      }
+      io.to(gameId).emit("game:message", systemMessage)
+
+      // Start the game timer
+      startGameTimer(gameId)
+    } catch (error) {
+      console.error(`Error starting game ${gameId}:`, error)
+      socket.emit("game:error", "Failed to start game")
+    }
   })
 
   // Handle player joining the game (from the join page)
@@ -213,6 +323,9 @@ io.on("connection", async (socket) => {
 
     // Save game to database
     await saveGameToDB(game)
+
+    // Log the game state after adding the player
+    logGameState(gameId)
 
     // Broadcast updated game state to all clients
     broadcastGameUpdate(gameId)
@@ -432,6 +545,32 @@ io.on("connection", async (socket) => {
     }
   })
 })
+
+// Helper function to generate roles
+function generateRoles(settings, playerCount) {
+  const roles = []
+
+  // Add special roles
+  for (let i = 0; i < settings.werewolves; i++) {
+    roles.push("werewolf")
+  }
+
+  for (let i = 0; i < settings.doctors; i++) {
+    roles.push("doctor")
+  }
+
+  for (let i = 0; i < settings.seers; i++) {
+    roles.push("seer")
+  }
+
+  // Fill the rest with villagers
+  const villagersCount = playerCount - roles.length
+  for (let i = 0; i < villagersCount; i++) {
+    roles.push("villager")
+  }
+
+  return roles
+}
 
 // Helper function to check if all night actions are complete
 async function checkNightActionsComplete(game) {
