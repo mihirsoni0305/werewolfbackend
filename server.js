@@ -172,6 +172,7 @@ io.on("connection", async (socket) => {
       game = await loadGameFromDB(gameId)
 
       if (!game) {
+        console.log(`[SOCKET] Game ${gameId} not found in database`)
         socket.emit("game:error", "Game not found")
         return
       }
@@ -186,52 +187,48 @@ io.on("connection", async (socket) => {
     console.log(`[SOCKET] Broadcast game state to other players in room ${gameId}`)
   })
 
-  // Handle game start request
+  // Handle game start request - FIXED VERSION
   socket.on("game:start", async ({ gameId }) => {
     console.log(`[SOCKET] Received game:start request for game ${gameId} from player ${playerId}`)
 
-    // First, reload the game from database to get the latest state
-    const game = await loadGameFromDB(gameId)
-    if (!game) {
-      console.log(`[SOCKET] Game ${gameId} not found in database`)
-      socket.emit("game:error", "Game not found")
-      return
-    }
-
-    console.log(`[SOCKET] Game ${gameId} current status: ${game.status}`)
-
-    // Check if the player is the host
-    if (game.host.id !== playerId) {
-      console.log(`[SOCKET] Player ${playerId} is not the host of game ${gameId}`)
-      socket.emit("game:error", "Only the host can start the game")
-      return
-    }
-
-    // Check if game is in the right status (either waiting or playing from server action)
-    if (game.status !== "waiting" && game.status !== "playing") {
-      console.log(`[SOCKET] Game ${gameId} has invalid status: ${game.status}`)
-      socket.emit("game:error", "Game cannot be started")
-      return
-    }
-
-    // Check minimum players
-    if (game.players.length < 5) {
-      console.log(`[SOCKET] Game ${gameId} has insufficient players: ${game.players.length}`)
-      socket.emit("game:error", "Need at least 5 players to start")
-      return
-    }
-
-    console.log(`[SOCKET] Starting game ${gameId} with ${game.players.length} players`)
-
     try {
-      // If the game status is already "playing" from server action, we just need to set up the game state
-      if (game.status === "playing" && !game.phase) {
-        console.log(`[SOCKET] Game ${gameId} was marked as playing by server action, setting up game state`)
-      } else if (game.status === "waiting") {
-        console.log(`[SOCKET] Game ${gameId} is in waiting state, updating to playing`)
-        game.status = "playing"
-        game.startedAt = new Date()
+      // First, reload the game from database to get the latest state
+      const game = await loadGameFromDB(gameId)
+      if (!game) {
+        console.log(`[SOCKET] Game ${gameId} not found in database`)
+        socket.emit("game:error", "Game not found")
+        return
       }
+
+      console.log(`[SOCKET] Game ${gameId} current status: ${game.status}, players: ${game.players.length}`)
+      logGameState(gameId)
+
+      // Check if the player is the host
+      if (game.host.id !== playerId) {
+        console.log(`[SOCKET] Player ${playerId} is not the host of game ${gameId}. Host is: ${game.host.id}`)
+        socket.emit("game:error", "Only the host can start the game")
+        return
+      }
+
+      // Check if game is in the right status
+      if (game.status !== "waiting" && game.status !== "playing") {
+        console.log(`[SOCKET] Game ${gameId} has invalid status: ${game.status}`)
+        socket.emit("game:error", `Game cannot be started. Current status: ${game.status}`)
+        return
+      }
+
+      // Check minimum players
+      if (game.players.length < 5) {
+        console.log(`[SOCKET] Game ${gameId} has insufficient players: ${game.players.length}`)
+        socket.emit("game:error", `Need at least 5 players to start. Current: ${game.players.length}`)
+        return
+      }
+
+      console.log(`[SOCKET] All validations passed. Starting game ${gameId} with ${game.players.length} players`)
+
+      // Update game status to playing
+      game.status = "playing"
+      game.startedAt = new Date()
 
       // Assign roles if not already assigned
       if (!game.players[0].role) {
@@ -239,20 +236,29 @@ io.on("connection", async (socket) => {
         const players = [...game.players]
         const roles = generateRoles(game.settings, players.length)
 
+        console.log(`[SOCKET] Generated roles:`, roles)
+
         // Shuffle roles
         for (let i = roles.length - 1; i > 0; i--) {
           const j = Math.floor(Math.random() * (i + 1))
             ;[roles[i], roles[j]] = [roles[j], roles[i]]
         }
 
+        console.log(`[SOCKET] Shuffled roles:`, roles)
+
         // Assign roles to players
         game.players = players.map((player, index) => ({
           ...player,
           role: roles[index],
         }))
+
+        console.log(`[SOCKET] Players with assigned roles:`)
+        game.players.forEach((player, index) => {
+          console.log(`[SOCKET]   ${index + 1}. ${player.name} -> ${player.role}`)
+        })
       }
 
-      // Set up game state
+      // Set up initial game state
       game.phase = "night"
       game.round = 1
       game.timeLeft = 30
@@ -265,14 +271,21 @@ io.on("connection", async (socket) => {
       game.votes = {}
       game.eliminations = []
 
+      console.log(`[SOCKET] Game ${gameId} setup complete. Saving to database...`)
+
       // Save to database
       await saveGameToDB(game)
 
-      console.log(`[SOCKET] Game ${gameId} started successfully`)
+      console.log(`[SOCKET] Game ${gameId} saved successfully. Broadcasting to all players...`)
 
-      // Broadcast game started event
+      // Update active games cache
+      activeGames.set(gameId, game)
+
+      // Broadcast game started event and updated state
       io.to(gameId).emit("game:started")
       io.to(gameId).emit("game:update", sanitizeGame(game))
+
+      console.log(`[SOCKET] Game ${gameId} started successfully and broadcasted to all players`)
 
       // Send system message
       const systemMessage = {
@@ -286,9 +299,11 @@ io.on("connection", async (socket) => {
 
       // Start the game timer
       startGameTimer(gameId)
+
+      console.log(`[SOCKET] Game ${gameId} fully initialized with timer started`)
     } catch (error) {
       console.error(`[SOCKET] Error starting game ${gameId}:`, error)
-      socket.emit("game:error", "Failed to start game")
+      socket.emit("game:error", `Failed to start game: ${error.message}`)
     }
   })
 
@@ -559,8 +574,10 @@ io.on("connection", async (socket) => {
   })
 })
 
-// Helper function to generate roles
+// Helper function to generate roles - FIXED VERSION
 function generateRoles(settings, playerCount) {
+  console.log(`[SOCKET] Generating roles for ${playerCount} players with settings:`, settings)
+
   const roles = []
 
   // Add special roles
@@ -582,6 +599,7 @@ function generateRoles(settings, playerCount) {
     roles.push("villager")
   }
 
+  console.log(`[SOCKET] Generated ${roles.length} roles:`, roles)
   return roles
 }
 
