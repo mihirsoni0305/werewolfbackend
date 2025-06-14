@@ -5,7 +5,8 @@ const { MongoClient } = require("mongodb")
 const cors = require("cors")
 
 // MongoDB connection
-const MONGODB_URI = process.env.MONGODB_URI || "mongodb://localhost:27017/werewolf"
+const MONGODB_URI = process.env.MONGODB_URI ||
+  "mongodb+srv://mihirsonidev:mihir%40123@cluster0.1tah4os.mongodb.net/werewolf?retryWrites=true&w=majority";
 const MONGODB_DB = process.env.MONGODB_DB || "werewolf"
 
 let db
@@ -55,14 +56,14 @@ async function connectToMongoDB() {
 // Game logic functions
 async function loadGameFromDB(gameId) {
   try {
-    console.log(`[SOCKET] Loading game ${gameId} from database`)
+    console.log(`Loading game ${gameId} from database`)
     const game = await db.collection("games").findOne({ gameId })
     if (game) {
-      console.log(`[SOCKET] Game ${gameId} loaded with ${game.players.length} players, status: ${game.status}`)
+      console.log(`Game ${gameId} loaded with ${game.players.length} players`)
       activeGames.set(gameId, game)
       return game
     }
-    console.log(`[SOCKET] Game ${gameId} not found in database`)
+    console.log(`Game ${gameId} not found in database`)
     return null
   } catch (error) {
     console.error("Error loading game:", error)
@@ -73,9 +74,7 @@ async function loadGameFromDB(gameId) {
 async function saveGameToDB(game) {
   try {
     await db.collection("games").updateOne({ gameId: game.gameId }, { $set: game }, { upsert: true })
-    console.log(
-      `[SOCKET] Game ${game.gameId} saved to database with ${game.players.length} players, status: ${game.status}`,
-    )
+    console.log(`Game ${game.gameId} saved to database with ${game.players.length} players`)
   } catch (error) {
     console.error("Error saving game:", error)
   }
@@ -85,23 +84,21 @@ async function saveGameToDB(game) {
 function broadcastGameUpdate(gameId) {
   const game = activeGames.get(gameId)
   if (!game) {
-    console.log(`[SOCKET] Cannot broadcast update for game ${gameId}: game not found`)
+    console.log(`Cannot broadcast update for game ${gameId}: game not found`)
     return
   }
 
   const sanitizedGame = sanitizeGame(game)
-  console.log(
-    `[SOCKET] Broadcasting game update to room ${gameId} with ${game.players.length} players, status: ${game.status}`,
-  )
+  console.log(`Broadcasting game update to room ${gameId} with ${game.players.length} players`)
 
   // Use room broadcasting
   io.to(gameId).emit("game:update", sanitizedGame)
-  console.log(`[SOCKET] Broadcast complete for game ${gameId}`)
+  console.log(`Broadcast complete for game ${gameId}`)
 }
 
 // Broadcast a message to all clients subscribed to this game
 function broadcastMessage(gameId, message) {
-  console.log(`[SOCKET] Broadcasting message to room ${gameId}:`, message.message)
+  console.log(`Broadcasting message to room ${gameId}:`, message.message)
   io.to(gameId).emit("game:message", message)
 }
 
@@ -134,16 +131,16 @@ function sanitizeGame(game) {
 function logGameState(gameId) {
   const game = activeGames.get(gameId)
   if (!game) {
-    console.log(`[SOCKET] Game ${gameId} not found in active games`)
+    console.log(`Game ${gameId} not found in active games`)
     return
   }
 
-  console.log(`[SOCKET] Game ${gameId} state:`)
-  console.log(`[SOCKET] - Status: ${game.status}`)
-  console.log(`[SOCKET] - Host: ${game.host.name} (${game.host.id})`)
-  console.log(`[SOCKET] - Players (${game.players.length}):`)
+  console.log(`Game ${gameId} state:`)
+  console.log(`- Status: ${game.status}`)
+  console.log(`- Host: ${game.host.name} (${game.host.id})`)
+  console.log(`- Players (${game.players.length}):`)
   game.players.forEach((player, index) => {
-    console.log(`[SOCKET]   ${index + 1}. ${player.name} (${player.id})`)
+    console.log(`  ${index + 1}. ${player.name} (${player.id})`)
   })
 }
 
@@ -151,19 +148,23 @@ function logGameState(gameId) {
 io.on("connection", async (socket) => {
   const { gameId, playerId } = socket.handshake.query
 
-  console.log(`[SOCKET] Socket ${socket.id} connected for game ${gameId}, player ${playerId}`)
-  console.log(`[SOCKET] Total connections: ${io.engine.clientsCount}`)
+  console.log(`Socket ${socket.id} connected for game ${gameId}, player ${playerId}`)
+  console.log(`Total connections: ${io.engine.clientsCount}`)
 
   // Store connection info
   activeConnections.set(socket.id, { gameId, playerId })
 
   // Join the game room
   socket.join(gameId)
-  console.log(`[SOCKET] Socket ${socket.id} joined room ${gameId}`)
+  console.log(`Socket ${socket.id} joined room ${gameId}`)
+
+  // Log all rooms this socket is in
+  const rooms = Array.from(socket.rooms)
+  console.log(`Socket ${socket.id} is in rooms:`, rooms)
 
   // Handle game join
   socket.on("game:join", async ({ gameId }) => {
-    console.log(`[SOCKET] Player ${playerId} joining game ${gameId}`)
+    console.log(`Player ${playerId} joining game ${gameId}`)
 
     let game = activeGames.get(gameId)
 
@@ -178,80 +179,67 @@ io.on("connection", async (socket) => {
 
     // Send game state to the client that just joined
     socket.emit("game:update", sanitizeGame(game))
-    console.log(`[SOCKET] Sent game state to player ${playerId}, status: ${game.status}`)
+    console.log(`Sent game state to player ${playerId}`)
 
     // Also broadcast to all other clients to ensure everyone has the latest state
     socket.to(gameId).emit("game:update", sanitizeGame(game))
-    console.log(`[SOCKET] Broadcast game state to other players in room ${gameId}`)
+    console.log(`Broadcast game state to other players in room ${gameId}`)
   })
 
   // Handle game start request
   socket.on("game:start", async ({ gameId }) => {
-    console.log(`[SOCKET] Received game:start request for game ${gameId} from player ${playerId}`)
+    console.log(`Received game:start request for game ${gameId} from player ${playerId}`)
 
-    // First, reload the game from database to get the latest state
-    const game = await loadGameFromDB(gameId)
+    let game = activeGames.get(gameId)
     if (!game) {
-      console.log(`[SOCKET] Game ${gameId} not found in database`)
-      socket.emit("game:error", "Game not found")
-      return
+      game = await loadGameFromDB(gameId)
+      if (!game) {
+        socket.emit("game:error", "Game not found")
+        return
+      }
     }
-
-    console.log(`[SOCKET] Game ${gameId} current status: ${game.status}`)
 
     // Check if the player is the host
     if (game.host.id !== playerId) {
-      console.log(`[SOCKET] Player ${playerId} is not the host of game ${gameId}`)
       socket.emit("game:error", "Only the host can start the game")
       return
     }
 
-    // Check if game is in the right status (either waiting or playing from server action)
-    if (game.status !== "waiting" && game.status !== "playing") {
-      console.log(`[SOCKET] Game ${gameId} has invalid status: ${game.status}`)
-      socket.emit("game:error", "Game cannot be started")
+    // Check if game is in waiting status
+    if (game.status !== "waiting") {
+      socket.emit("game:error", "Game has already started or finished")
       return
     }
 
     // Check minimum players
     if (game.players.length < 5) {
-      console.log(`[SOCKET] Game ${gameId} has insufficient players: ${game.players.length}`)
       socket.emit("game:error", "Need at least 5 players to start")
       return
     }
 
-    console.log(`[SOCKET] Starting game ${gameId} with ${game.players.length} players`)
+    console.log(`Starting game ${gameId}...`)
 
     try {
-      // If the game status is already "playing" from server action, we just need to set up the game state
-      if (game.status === "playing" && !game.phase) {
-        console.log(`[SOCKET] Game ${gameId} was marked as playing by server action, setting up game state`)
-      } else if (game.status === "waiting") {
-        console.log(`[SOCKET] Game ${gameId} is in waiting state, updating to playing`)
-        game.status = "playing"
-        game.startedAt = new Date()
+      // Assign roles
+      const players = [...game.players]
+      const roles = generateRoles(game.settings, players.length)
+
+      // Shuffle roles
+      for (let i = roles.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1))
+          ;[roles[i], roles[j]] = [roles[j], roles[i]]
       }
 
-      // Assign roles if not already assigned
-      if (!game.players[0].role) {
-        console.log(`[SOCKET] Assigning roles for game ${gameId}`)
-        const players = [...game.players]
-        const roles = generateRoles(game.settings, players.length)
+      // Assign roles to players
+      const playersWithRoles = players.map((player, index) => ({
+        ...player,
+        role: roles[index],
+      }))
 
-        // Shuffle roles
-        for (let i = roles.length - 1; i > 0; i--) {
-          const j = Math.floor(Math.random() * (i + 1))
-            ;[roles[i], roles[j]] = [roles[j], roles[i]]
-        }
-
-        // Assign roles to players
-        game.players = players.map((player, index) => ({
-          ...player,
-          role: roles[index],
-        }))
-      }
-
-      // Set up game state
+      // Update game status and players
+      game.status = "playing"
+      game.players = playersWithRoles
+      game.startedAt = new Date()
       game.phase = "night"
       game.round = 1
       game.timeLeft = 30
@@ -267,7 +255,7 @@ io.on("connection", async (socket) => {
       // Save to database
       await saveGameToDB(game)
 
-      console.log(`[SOCKET] Game ${gameId} started successfully`)
+      console.log(`Game ${gameId} started successfully`)
 
       // Broadcast game started event
       io.to(gameId).emit("game:started")
@@ -286,14 +274,14 @@ io.on("connection", async (socket) => {
       // Start the game timer
       startGameTimer(gameId)
     } catch (error) {
-      console.error(`[SOCKET] Error starting game ${gameId}:`, error)
+      console.error(`Error starting game ${gameId}:`, error)
       socket.emit("game:error", "Failed to start game")
     }
   })
 
   // Handle player joining the game (from the join page)
   socket.on("player:join", async ({ gameId, playerName }) => {
-    console.log(`[SOCKET] New player ${playerName} (${playerId}) joining game ${gameId}`)
+    console.log(`New player ${playerName} (${playerId}) joining game ${gameId}`)
 
     let game = activeGames.get(gameId)
     if (!game) {
@@ -319,7 +307,7 @@ io.on("connection", async (socket) => {
     // Check if player already exists (by ID)
     const existingPlayer = game.players.find((p) => p.id === playerId)
     if (existingPlayer) {
-      console.log(`[SOCKET] Player ${playerName} (${playerId}) already in game`)
+      console.log(`Player ${playerName} (${playerId}) already in game`)
       socket.emit("game:update", sanitizeGame(game))
       return
     }
@@ -500,7 +488,7 @@ io.on("connection", async (socket) => {
     if (!connectionData) return
 
     const { gameId, playerId } = connectionData
-    console.log(`[SOCKET] Socket ${socket.id} disconnected (Player ${playerId}, Game ${gameId})`)
+    console.log(`Socket ${socket.id} disconnected (Player ${playerId}, Game ${gameId})`)
 
     // Remove from active connections
     activeConnections.delete(socket.id)
@@ -524,18 +512,18 @@ io.on("connection", async (socket) => {
         if (playerIndex !== -1) {
           const playerName = game.players[playerIndex].name
           game.players.splice(playerIndex, 1)
-          console.log(`[SOCKET] Player ${playerName} (${playerId}) removed from game ${gameId}`)
+          console.log(`Player ${playerName} (${playerId}) removed from game ${gameId}`)
 
           // If host left, assign a new host
           if (game.host.id === playerId && game.players.length > 0) {
             game.host = game.players[0]
-            console.log(`[SOCKET] New host assigned: ${game.host.name} (${game.host.id})`)
+            console.log(`New host assigned: ${game.host.name} (${game.host.id})`)
           }
 
           // If no players left, remove the game
           if (game.players.length === 0) {
             activeGames.delete(gameId)
-            console.log(`[SOCKET] Game ${gameId} removed (no players left)`)
+            console.log(`Game ${gameId} removed (no players left)`)
             return
           }
 
